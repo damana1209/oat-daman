@@ -168,3 +168,5 @@ cmd
 *.csv
 *.pdf
 *.ttf
+
+wandb/
