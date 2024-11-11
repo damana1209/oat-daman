@@ -225,6 +225,7 @@ class Actor:
 
         # step 2a. optional selection
         results = None
+        # TODO: Add algorithm for selecting BoN and return as candidate
         if self.sampling_params.n > 2:
             results: ExplorationResults
             results = self.explorer.select(prompts, all_candidates)
