@@ -72,6 +72,7 @@ class LearnerBase(abc.ABC, DistributedLauncher):
         self.args = args
         self.actors = actors
         self.ipc_server = ipc_server
+        self.best_running_responses = None
 
     def _init(self, args: OATArgs, actors: List[Actor]) -> None:
         args, strategy = get_strategy(args)
@@ -277,6 +278,11 @@ class LearnerBase(abc.ABC, DistributedLauncher):
         formatted_prompts: List[str],
         refs: Union[str, List[str]],
     ):
+        if self.best_running_responses is None:
+            self.best_running_responses = {}
+            for _, (prompt, ref) in enumerate(zip(formatted_prompts, refs)):
+                self.best_running_responses[prompt] = ref
+        self.strategy.print(f"For prompt:\n{formatted_prompts[0]}\nBest running response:\n{self.best_running_responses[formatted_prompts[0]]}")
         # generate response & get feedback
         st_time = time.time()
         rank = torch.distributed.get_rank()
