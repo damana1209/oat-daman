@@ -91,6 +91,7 @@ class OATArgs:
     # Take the top 2 best actions.
     exp_allow_second_best: bool = False
     # Enable SEA's Mixed Preference Learning (Dyna)
+    best_of_n_exploration: bool = False
     model_rollout: bool = False
     max_model_data_ratio: float = 0.3
     burn_in_period: int = 5
