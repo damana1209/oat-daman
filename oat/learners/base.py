@@ -278,7 +278,9 @@ class LearnerBase(abc.ABC, DistributedLauncher):
         formatted_prompts: List[str],
         refs: Union[str, List[str]],
     ):
+        breakpoint()
         if self.best_running_responses is None:
+            # TODO: How to manage this across learners?
             self.best_running_responses = {}
             for _, (prompt, ref) in enumerate(zip(formatted_prompts, refs)):
                 self.best_running_responses[prompt] = ref
@@ -287,11 +289,11 @@ class LearnerBase(abc.ABC, DistributedLauncher):
         st_time = time.time()
         rank = torch.distributed.get_rank()
         actor = self.actors[rank % len(self.actors)]
-
+        # TODO: Update best responses
         if self.strategy.args.online_evaluation:
-            handle = actor.step(prompts, formatted_prompts, refs)
+            handle = actor.step(prompts, formatted_prompts, refs, best_running_responses=self.best_running_responses)
         else:
-            handle = actor.step(prompts, formatted_prompts)
+            handle = actor.step(prompts, formatted_prompts, best_running_responses=self.best_running_responses)
 
         preference_data: List[PreferenceData] = self.ipc_client.deserialize_ipc(handle)
 
