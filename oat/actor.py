@@ -14,7 +14,7 @@
 
 import logging
 import time
-from typing import List
+from typing import Dict, List
 
 import numpy as np
 import torch
@@ -23,11 +23,12 @@ import vllm
 
 from oat import oracles
 from oat.args import OATArgs
-from oat.exploration import ExplorationResults, Explorer, ModelBasedExplorer
+from oat.exploration import ExplorationResults, Explorer, ModelBasedExplorer, BestOfNExplorer
 from oat.rm import backbone, model
 from oat.types import PreferenceData
 from oat.utils.distributed import WorkerWrap, torch_type_codec
 from oat.utils.ipc import PlasmaShmClient
+from oat.model import LLM
 
 logging.getLogger("vllm").setLevel(logging.ERROR)
 
@@ -93,24 +94,54 @@ class Actor:
         else:
             assert self.sampling_params.n > 2
             # We assume reward model-based explorer.
-            rm_backbone_cls = backbone.get_cls(args.rm_backbone)
-            logging.info(f"Using RM backbone {args.rm_backbone} {rm_backbone_cls}")
-            self.rm_backbone = rm_backbone_cls.from_pretrained(
-                args.rm_backbone, device_map="cuda:0"
-            ).eval()
-
-            explorer_cls = ModelBasedExplorer if args.model_rollout else Explorer
-            self.explorer = explorer_cls(
-                reward_model=getattr(model, args.exp_method)(args).cuda(),
-                rm_backbone=self.rm_backbone,
-                args=args,
-            )
+            if args.best_of_n_exploration:
+                self.curr_model = LLM(
+                    vllm_args['model'],
+                    use_flash_attention_2=args.flash_attn,
+                    bf16=args.bf16,
+                    load_in_4bit=args.load_in_4bit,
+                    lora_rank=args.lora_rank,
+                    lora_alpha=args.lora_alpha,
+                    lora_dropout=args.lora_dropout,
+                    target_modules=args.target_modules,
+                    device_map="cpu"
+                )
+                self.ref_model = LLM(
+                    args.ref_pretrain,
+                    use_flash_attention_2=args.flash_attn,
+                    bf16=args.bf16,
+                    load_in_4bit=args.load_in_4bit,
+                    lora_rank=args.lora_rank,
+                    lora_alpha=args.lora_alpha,
+                    lora_dropout=args.lora_dropout,
+                    target_modules=args.target_modules,
+                    device_map="cpu"
+                )
+                self.explorer = BestOfNExplorer(
+                    model=self.curr_model,
+                    ref_model=self.ref_model,
+                    args=args
+                )
+            else:
+                rm_backbone_cls = backbone.get_cls(args.rm_backbone)
+                logging.info(f"Using RM backbone {args.rm_backbone} {rm_backbone_cls}")
+                self.rm_backbone = rm_backbone_cls.from_pretrained(
+                    args.rm_backbone, device_map="cuda:0"
+                ).eval()
+                explorer_cls = ModelBasedExplorer if args.model_rollout else Explorer
+                self.explorer = explorer_cls(
+                    reward_model=getattr(model, args.exp_method)(args).cuda(),
+                    rm_backbone=self.rm_backbone,
+                    args=args,
+                )
 
             if args.rm_pretrain:
                 logging.info(f"Loading pretrained ENN from {args.rm_pretrain}")
                 self.explorer.reward_model.load_state_dict(torch.load(args.rm_pretrain))
             else:
-                self.learning_rm = True  # Learn RM online.
+                # TODO: too ugly
+                if not args.best_of_n_exploration:
+                    self.learning_rm = True  # Learn RM online.
         self.model_rollout = args.model_rollout
 
         # ###################################
@@ -203,6 +234,7 @@ class Actor:
         prompts: List[str],
         formatted_prompts: List[str],
         references: List[str] = None,
+        best_running_responses: Dict[str, str] = None,
     ) -> List[PreferenceData]:
         """Step the actor.
 
@@ -225,10 +257,9 @@ class Actor:
 
         # step 2a. optional selection
         results = None
-        # TODO: Add algorithm for selecting BoN and return as candidate
         if self.sampling_params.n > 2:
             results: ExplorationResults
-            results = self.explorer.select(prompts, all_candidates)
+            results = self.explorer.select(prompts, all_candidates, best_running_responses)
             candidates = results.dueling_candidates
         else:
             candidates = all_candidates
