@@ -27,6 +27,8 @@ from oat.rm import uncertainty
 from oat.rm.backbone import RMBackbone
 from oat.rm.model import RewardModel
 from oat.types import Metric
+from oat.utils.data import get_tokenizer, _preprocess_preference_data, zero_pad_sequences
+from torch.utils.data import Dataset, DataLoader
 
 
 @dataclass
@@ -82,6 +84,214 @@ class ExplorerBase(abc.ABC):
         Returns:
             torch.Tensor: (M,), 1 means the first wins
         """
+
+class CompletionDataset(Dataset):
+    def __init__(self, prompt, completions, tokenizer, args):
+        self.prompt = prompt
+        self.completions = completions
+        self.tokenizer = tokenizer
+        self.prompt_ids_lens = []
+        self.args = args
+        self.sequences = []
+        for completion in self.completions:
+            if self.args.apply_chat_template:
+                processed = self.tokenizer.apply_chat_template(
+                    [{"content": prompt, "role": "user"},
+                    {"content": completion, "role": "assistant"}]
+                )
+            else:
+                processed = (prompt + completion).rstrip("\n")
+                if not processed.endswith(self.tokenizer.eos_token):
+                    processed += " " + self.tokenizer.eos_token
+                self.sequences.append(processed)
+        
+        self.encoded = self.tokenizer.batch_encode_plus(
+            self.sequences, 
+            max_length=self.args.prompt_max_length,
+            padding=True,
+            truncation=True,
+            return_tensors="pt"
+        )
+        prompt_token = self.tokenizer(
+            prompt,
+            max_length=self.args.prompt_max_length,
+            padding=False,
+            truncation=True,
+            return_tensors="pt",
+        )
+        prompt_ids_len = prompt_token["attention_mask"].int().sum().item()
+        self.prompt_ids_lens = [prompt_ids_len] * len(self.completions)
+    
+
+    def __len__(self):
+        return len(self.completions)
+
+    def __getitem__(self, idx):
+        return (
+            self.encoded['input_ids'][idx],
+            self.encoded['attention_mask'][idx],
+            self.prompt_ids_lens[idx]
+        )
+    
+    def collate_fn(self, item_list):
+        chosen_ids = []
+        chosen_masks = []
+        rejected_ids = []
+        rejected_masks = []
+        extras = {"prompt_ids_lens": [], "same_masks": [], "chosen_ids": []}
+        for chosen_id, chosen_mask, rejected_id, rejected_mask, extra in item_list:
+            chosen_ids.append(chosen_id)
+            chosen_masks.append(chosen_mask)
+            rejected_ids.append(rejected_id)
+            rejected_masks.append(rejected_mask)
+            extras["prompt_ids_lens"].append(extra["prompt_ids_lens"])
+            extras["same_masks"].append(extra["same_masks"])
+            extras["chosen_ids"].append(extra["chosen_ids"])
+
+        padding_side = "right"
+        chosen_ids = zero_pad_sequences(
+            chosen_ids, side=padding_side, value=self.tokenizer.pad_token_id
+        )
+        chosen_masks = zero_pad_sequences(chosen_masks, side=padding_side)
+        rejected_ids = zero_pad_sequences(
+            rejected_ids, side=padding_side, value=self.tokenizer.pad_token_id
+        )
+        rejected_masks = zero_pad_sequences(rejected_masks, side=padding_side)
+        return chosen_ids, chosen_masks, rejected_ids, rejected_masks, extras
+
+
+class BestOfNExplorer(ExplorerBase):
+    def __init__(
+        self, model, ref_model, args:OATArgs
+    ):
+        # TODO: Add type-hints
+        self.model = model
+        self.ref_model = ref_model
+        self.args = args
+        self.tokenizer = get_tokenizer(
+            args.pretrain,
+            model,
+            "left",
+            use_fast=not args.disable_fast_tokenizer,
+        )
+        apply_chat_template = args.apply_chat_template
+        if apply_chat_template:
+            apply_chat_template = self.tokenizer.apply_chat_template
+            tokenizer_chat_template = getattr(
+                self.strategy.args, "tokenizer_chat_template", None
+            )
+            if tokenizer_chat_template:
+                self.tokenizer.chat_template = tokenizer_chat_template
+
+    def compare(self, candidate_features: torch.Tensor) -> torch.Tensor:
+        # Just a dummy
+        rewards = self.reward_model.get_rewards(candidate_features).mean(0)  # (M, 2, 1)
+        return (rewards[:, 0] > rewards[:, 1]).squeeze().float().cpu().numpy()
+    
+    def create_dataloader(self, prompt, candidates):
+        # Remember not to shuffle
+        return DataLoader(
+            CompletionDataset(prompt, candidates, self.tokenizer, self.args),
+            batch_size=self.args.train_batch_size_per_device,
+            shuffle=True,
+            drop_last=False,
+            pin_memory=True,
+        )
+    
+    def get_log_probs(self, model, prompts, candidates):
+        """Return log probs of all candidates for all prompts
+        """ 
+        # TODO this is wrong probably, check again.
+        all_logps = []
+        for i, prompt in enumerate(prompts):
+            dataloader = self.create_dataloader(prompt, candidates[i])
+            # Batch for each prompt
+            logps = []
+            for data in dataloader:
+                input_ids, att_masks, prompt_id_lens = data
+                device = model.model.device
+                input_ids, att_masks, prompt_id_lens = input_ids.to(device), att_masks.to(device), prompt_id_lens.to(device)
+                output = model(input_ids, attention_mask=att_masks)
+                logits = output["logits"]
+
+                labels = input_ids[:, 1:].clone()
+                logits = logits[:, :-1, :]
+
+                loss_masks = att_masks.clone().bool()
+                # mask prompts
+                for mask, source_len in zip(loss_masks, prompt_id_lens):
+                    mask[:source_len] = False
+                loss_masks = loss_masks[:, 1:]
+
+                # dummy token; we'll ignore the losses on these tokens later
+                labels[loss_masks == False] = 0
+                per_token_logps = torch.gather(
+                    logits.log_softmax(-1), dim=2, index=labels.unsqueeze(2)
+                ).squeeze(2)
+
+                logp = (per_token_logps * loss_masks).sum(-1)
+                logps.extend(logp.cpu().tolist())
+            all_logps.append(logps)
+            # Create pairing of prompt with candidates
+        return torch.Tensor(all_logps)
+    
+    def best_of_n(
+        self,
+        prompts: List[str],
+        candidates: Dict[int, List[str]],
+    ) -> List[str]:
+        """Best-of-N generation given the reward model.
+
+        OATArgs:
+            prompts (List[str]): A list of prompt texts, M
+            candidates (Dict[int, List[str]]): Lists of responses per prompt, M -> N
+
+        Returns:
+            List[str]: A list of the best response per prompt.
+        """
+        print("Trying to get best of n")
+        self.model.model.to('cuda:0')
+        self.ref_model.model.to('cuda:0')
+        ref_log_probs_BN = self.get_log_probs(self.ref_model, prompts, candidates)
+        model_log_probs_BN = self.get_log_probs(self.model, prompts, candidates)
+        rew_BN = model_log_probs_BN - ref_log_probs_BN
+        rew_B = torch.argmax(rew_BN, dim=1).cpu().tolist()
+        best_of_n = []
+        for i, prompt in enumerate(prompts):
+            best_of_n.append(candidates[i][rew_B[i]])
+        self.model.model.to('cpu')
+        self.ref_model.model.to('cpu')
+        return best_of_n
+    
+    def select(
+        self,
+        prompts: List[str],
+        candidates: Dict[int, List[str]],
+        best_running_responses: Dict[str, str]
+    ) -> ExplorationResults:
+        """Select dueling responses from candidates.
+
+        OATArgs:
+            prompts (List[str]): A list of prompt texts, M
+            candidates (Dict[int, List[str]]): Lists of responses per prompt, M -> N
+
+        Returns:
+            ExplorationResults: Pair of responses per prompt (and features), M -> 2
+        """
+        best_of_candidates = self.best_of_n(prompts, candidates)
+        dueling_candidates = {}
+        for i, prompt in enumerate(prompts):
+            dueling_candidates[i] = [best_of_candidates[i], best_running_responses[prompt]]
+
+        return ExplorationResults(
+            dueling_candidates=dueling_candidates,
+            candidate_features=None, # not needed since it is not a learning RM
+            init_clash=[False] * len(prompts),
+            is_model_data=[False] * len(prompts),
+            all_rewards=None, # not needed
+            info={},
+        )
+    
 
 
 class Explorer(ExplorerBase):
@@ -400,7 +610,7 @@ class ModelBasedExplorer(Explorer):
                     ]
                 )
             ),
-            init_clash=init_clash.tolist(),
+            init_clash=[False]*len(prompts),
             is_model_data=is_model_data.astype("bool").tolist(),
             all_rewards=rewards,
             info=info,
