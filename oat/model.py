@@ -40,6 +40,7 @@ class LLM(nn.Module):
         use_flash_attention_2=False,
         bf16=True,
         load_in_4bit=False,
+        load_in_full_precision=False,
         lora_rank=0,
         lora_alpha=16,
         lora_dropout=0,
@@ -49,7 +50,6 @@ class LLM(nn.Module):
         **kwargs,
     ) -> None:
         super().__init__()
-
         if isinstance(pretrain_or_model, str):
             attn_implementation = (
                 "flash_attention_2" if use_flash_attention_2 else "eager"
@@ -66,12 +66,16 @@ class LLM(nn.Module):
             else:
                 nf4_config = None
 
+            if load_in_full_precision:
+                dtype = None
+            else:
+                dtype = torch.bfloat16 if bf16 else "auto"
             self.model = AutoModelForCausalLM.from_pretrained(
                 pretrain_or_model,
                 trust_remote_code=True,
                 attn_implementation=attn_implementation,
                 quantization_config=nf4_config,
-                torch_dtype=torch.bfloat16 if bf16 else "auto",
+                torch_dtype=dtype,
                 device_map=device_map,
             )
 

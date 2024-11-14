@@ -170,3 +170,4 @@ cmd
 *.ttf
 
 wandb/
+logs/

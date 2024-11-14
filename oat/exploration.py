@@ -97,12 +97,12 @@ class CompletionDataset(Dataset):
             if self.args.apply_chat_template:
                 processed = self.tokenizer.apply_chat_template(
                     [{"content": prompt, "role": "user"},
-                    {"content": completion, "role": "assistant"}]
+                    {"content": completion['text'], "role": "assistant"}]
                 )
             else:
-                processed = (prompt + completion).rstrip("\n")
+                processed = (prompt + completion['text']).rstrip("\n")
                 if not processed.endswith(self.tokenizer.eos_token):
-                    processed += " " + self.tokenizer.eos_token
+                    processed += self.tokenizer.eos_token
                 self.sequences.append(processed)
         
         self.encoded = self.tokenizer.batch_encode_plus(
@@ -134,44 +134,34 @@ class CompletionDataset(Dataset):
         )
     
     def collate_fn(self, item_list):
-        chosen_ids = []
-        chosen_masks = []
-        rejected_ids = []
-        rejected_masks = []
+        input_ids = []
+        att_masks = []
+        prompt_ids_lens = []
         extras = {"prompt_ids_lens": [], "same_masks": [], "chosen_ids": []}
-        for chosen_id, chosen_mask, rejected_id, rejected_mask, extra in item_list:
-            chosen_ids.append(chosen_id)
-            chosen_masks.append(chosen_mask)
-            rejected_ids.append(rejected_id)
-            rejected_masks.append(rejected_mask)
-            extras["prompt_ids_lens"].append(extra["prompt_ids_lens"])
-            extras["same_masks"].append(extra["same_masks"])
-            extras["chosen_ids"].append(extra["chosen_ids"])
+        for input_id, att_mask, prompt_ids_len in item_list:
+            input_ids.append(input_id)
+            att_masks.append(att_mask)
+            prompt_ids_lens.append(prompt_ids_len)
 
         padding_side = "right"
-        chosen_ids = zero_pad_sequences(
-            chosen_ids, side=padding_side, value=self.tokenizer.pad_token_id
+        input_ids = zero_pad_sequences(
+            input_ids, side=padding_side, value=self.tokenizer.pad_token_id
         )
-        chosen_masks = zero_pad_sequences(chosen_masks, side=padding_side)
-        rejected_ids = zero_pad_sequences(
-            rejected_ids, side=padding_side, value=self.tokenizer.pad_token_id
-        )
-        rejected_masks = zero_pad_sequences(rejected_masks, side=padding_side)
-        return chosen_ids, chosen_masks, rejected_ids, rejected_masks, extras
+        att_masks = zero_pad_sequences(att_masks, side=padding_side)
+        return input_ids, att_masks, prompt_ids_lens
 
 
 class BestOfNExplorer(ExplorerBase):
     def __init__(
-        self, model, ref_model, args:OATArgs
+        self, ref_model, args:OATArgs
     ):
         # TODO: Add type-hints
-        self.model = model
         self.ref_model = ref_model
         self.args = args
         self.tokenizer = get_tokenizer(
             args.pretrain,
-            model,
-            "left",
+            ref_model,
+            "right",
             use_fast=not args.disable_fast_tokenizer,
         )
         apply_chat_template = args.apply_chat_template
@@ -190,18 +180,18 @@ class BestOfNExplorer(ExplorerBase):
     
     def create_dataloader(self, prompt, candidates):
         # Remember not to shuffle
+        dataset = CompletionDataset(prompt, candidates, self.tokenizer, self.args)
         return DataLoader(
-            CompletionDataset(prompt, candidates, self.tokenizer, self.args),
+            dataset,
             batch_size=self.args.train_batch_size_per_device,
-            shuffle=True,
+            shuffle=False,
             drop_last=False,
-            pin_memory=True,
+            pin_memory=True
         )
     
     def get_log_probs(self, model, prompts, candidates):
         """Return log probs of all candidates for all prompts
-        """ 
-        # TODO this is wrong probably, check again.
+        """
         all_logps = []
         for i, prompt in enumerate(prompts):
             dataloader = self.create_dataloader(prompt, candidates[i])
@@ -214,8 +204,10 @@ class BestOfNExplorer(ExplorerBase):
                 output = model(input_ids, attention_mask=att_masks)
                 logits = output["logits"]
 
+                # Start from the first position
                 labels = input_ids[:, 1:].clone()
-                logits = logits[:, :-1, :]
+                # labels = input_ids.clone()
+                logits = logits[:, :-1, :].float()
 
                 loss_masks = att_masks.clone().bool()
                 # mask prompts
@@ -250,16 +242,14 @@ class BestOfNExplorer(ExplorerBase):
             List[str]: A list of the best response per prompt.
         """
         print("Trying to get best of n")
-        self.model.model.to('cuda:0')
         self.ref_model.model.to('cuda:0')
         ref_log_probs_BN = self.get_log_probs(self.ref_model, prompts, candidates)
-        model_log_probs_BN = self.get_log_probs(self.model, prompts, candidates)
+        model_log_probs_BN = torch.Tensor([[c['logprob'] for c in candidates[i]] for i in range(len(prompts))])
         rew_BN = model_log_probs_BN - ref_log_probs_BN
         rew_B = torch.argmax(rew_BN, dim=1).cpu().tolist()
         best_of_n = []
         for i, prompt in enumerate(prompts):
-            best_of_n.append(candidates[i][rew_B[i]])
-        self.model.model.to('cpu')
+            best_of_n.append(candidates[i][rew_B[i]]['text'])
         self.ref_model.model.to('cpu')
         return best_of_n
     

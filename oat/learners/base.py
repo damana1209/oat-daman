@@ -49,6 +49,7 @@ from oat.utils.distributed import (
 )
 from oat.utils.ipc import PlasmaShmClient, PlasmaShmServer
 from oat.utils.launcher import DistributedLauncher
+import pickle
 
 
 class LearnerBase(abc.ABC, DistributedLauncher):
@@ -72,7 +73,7 @@ class LearnerBase(abc.ABC, DistributedLauncher):
         self.args = args
         self.actors = actors
         self.ipc_server = ipc_server
-        self.best_running_responses = None
+        self.best_running_responses = {}
 
     def _init(self, args: OATArgs, actors: List[Actor]) -> None:
         args, strategy = get_strategy(args)
@@ -130,6 +131,10 @@ class LearnerBase(abc.ABC, DistributedLauncher):
         strategy.print("Prompt dataset example:")
         strategy.print(self.prompts_dataset[0])
         strategy.print("Prompt dataset len:", len(self.prompts_dataset))
+        # Set up best running responses
+        for processed_prompts, raw_prompts, refs in self.prompts_dataloader:
+            for _, (prompt, ref) in enumerate(zip(processed_prompts, refs)):
+                self.best_running_responses[prompt] = ref
 
         self.eval_input_key = args.eval_input_key or args.input_key
         self.eval_output_key = args.eval_output_key or args.output_key
@@ -264,6 +269,7 @@ class LearnerBase(abc.ABC, DistributedLauncher):
             pin_memory=True,
             shuffle=True,
         )
+        strategy.print(f"len(prompts_dataloader): {len(self.prompts_dataloader)}")
         self.eval_prompts_dataloader = DataLoader(
             self.eval_prompts_dataset,
             batch_size=strategy.args.eval_batch_size,
@@ -278,24 +284,23 @@ class LearnerBase(abc.ABC, DistributedLauncher):
         formatted_prompts: List[str],
         refs: Union[str, List[str]],
     ):
-        breakpoint()
-        if self.best_running_responses is None:
-            # TODO: How to manage this across learners?
-            self.best_running_responses = {}
-            for _, (prompt, ref) in enumerate(zip(formatted_prompts, refs)):
-                self.best_running_responses[prompt] = ref
         self.strategy.print(f"For prompt:\n{formatted_prompts[0]}\nBest running response:\n{self.best_running_responses[formatted_prompts[0]]}")
         # generate response & get feedback
         st_time = time.time()
         rank = torch.distributed.get_rank()
         actor = self.actors[rank % len(self.actors)]
-        # TODO: Update best responses
         if self.strategy.args.online_evaluation:
             handle = actor.step(prompts, formatted_prompts, refs, best_running_responses=self.best_running_responses)
         else:
             handle = actor.step(prompts, formatted_prompts, best_running_responses=self.best_running_responses)
 
         preference_data: List[PreferenceData] = self.ipc_client.deserialize_ipc(handle)
+        # TODO: Update best responses
+        percentage_selected = 0
+        for i, prompt in enumerate(formatted_prompts):
+            if preference_data[i].chosen_response != self.best_running_responses[prompt]:
+                percentage_selected += 1
+            self.best_running_responses[prompt] = preference_data[i].chosen_response
 
         actor_time = time.time() - st_time
 
@@ -316,6 +321,7 @@ class LearnerBase(abc.ABC, DistributedLauncher):
                 ]
             ),
             "actor/chosen_id": np.mean([p.chosen_id for p in preference_data]),
+            "actor/best_of_n_selected": percentage_selected / len(prompts)
         }
 
         mean_info = tree.map_structure(
@@ -380,6 +386,7 @@ class LearnerBase(abc.ABC, DistributedLauncher):
 
                 progress_bar.update()
                 self.steps += 1
+                self.strategy.print(f"Step: {self.steps}")
 
                 if self.get_current_query() > self.args.max_queries:
                     early_stop = True
@@ -570,6 +577,9 @@ class LearnerBase(abc.ABC, DistributedLauncher):
             if self.strategy.is_rank_0():
                 if self.pi_buffer:
                     self.strategy.pprint(np.random.choice(self.pi_buffer))
+                    # Save the pi_buffer
+                    with open(f'{self.save_path}/pi_buffer_{self.steps}', 'wb') as f:
+                        pickle.dump(self.pi_buffer, f)
                 self.strategy.pprint(logs_dict)
                 if self._wandb is not None:
                     self._wandb.log(logs_dict)

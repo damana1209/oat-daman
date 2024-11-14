@@ -54,6 +54,7 @@ class Actor:
             top_k=args.top_k,
             max_tokens=args.generate_max_length,
             n=args.num_samples,
+            logprobs=None # Manually set
         )
 
         self.__vllm_version__ = vllm.__version__
@@ -95,21 +96,11 @@ class Actor:
             assert self.sampling_params.n > 2
             # We assume reward model-based explorer.
             if args.best_of_n_exploration:
-                self.curr_model = LLM(
-                    vllm_args['model'],
-                    use_flash_attention_2=args.flash_attn,
-                    bf16=args.bf16,
-                    load_in_4bit=args.load_in_4bit,
-                    lora_rank=args.lora_rank,
-                    lora_alpha=args.lora_alpha,
-                    lora_dropout=args.lora_dropout,
-                    target_modules=args.target_modules,
-                    device_map="cpu"
-                )
                 self.ref_model = LLM(
                     args.ref_pretrain,
                     use_flash_attention_2=args.flash_attn,
                     bf16=args.bf16,
+                    load_in_full_precision=False,
                     load_in_4bit=args.load_in_4bit,
                     lora_rank=args.lora_rank,
                     lora_alpha=args.lora_alpha,
@@ -118,7 +109,6 @@ class Actor:
                     device_map="cpu"
                 )
                 self.explorer = BestOfNExplorer(
-                    model=self.curr_model,
                     ref_model=self.ref_model,
                     args=args
                 )
@@ -173,7 +163,11 @@ class Actor:
             candidates[i] = []
             for k in range(sampling_params.n):
                 # for each response
-                candidates[i].append(outputs[i].outputs[k].text.strip())
+                if sampling_params.logprobs:
+                    candidates[i].append({'text': outputs[i].outputs[k].text.strip(), 'logprob': outputs[i].outputs[k].cumulative_logprob, 'rest': outputs[i].outputs[k] })
+                else:
+                    candidates[i].append(outputs[i].outputs[k].text.strip())
+                    # TODO: Shouldn't be stripped here?
         return candidates
 
     def generate_and_maybe_eval(
@@ -259,7 +253,8 @@ class Actor:
         results = None
         if self.sampling_params.n > 2:
             results: ExplorationResults
-            results = self.explorer.select(prompts, all_candidates, best_running_responses)
+            # Not sure why prompts is here.
+            results = self.explorer.select(formatted_prompts, all_candidates, best_running_responses)
             candidates = results.dueling_candidates
         else:
             candidates = all_candidates
