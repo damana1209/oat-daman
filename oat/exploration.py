@@ -324,6 +324,7 @@ class Explorer(ExplorerBase):
         self,
         prompts: List[str],
         candidates: Dict[int, List[str]],
+        best_running_responses: Dict[str, str]=None,
     ) -> ExplorationResults:
         """Select dueling responses from candidates.
 
@@ -515,7 +516,7 @@ class ModelBasedExplorer(Explorer):
         return dueling_candidates, selected_candidate_indices, is_model_data
 
     def select(
-        self, prompts: List[str], candidates: Dict[int, List[str]]
+        self, prompts: List[str], candidates: Dict[int, List[str]], best_running_responses=None
     ) -> ExplorationResults:
         # Select the query points using exploration strategies.
         # Be optimistic and reduce uncertainty.

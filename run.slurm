@@ -1,10 +1,11 @@
 #!/bin/bash
 #SBATCH --mem=100g
+#SBATCH --partition=gpuA40x4
 #SBATCH --nodes=1
 #SBATCH --gpus=2
 #SBATCH --account=bcuv-delta-gpu   # <- match to a "Project" returned by the "accounts" command
 #SBATCH --job-name=run
-#SBATCH --time=03:00:00      # hh:mm:ss for the job
+#SBATCH --time=10:00:00      # hh:mm:ss for the job
 #SBATCH -e logs/slurm-%j.err
 #SBATCH -o logs/slurm-%j.out
 
@@ -21,4 +22,7 @@ conda activate oat
 which conda
 which python
 which pip
-./run_naive.sh
+# ./run_offline_dpo.sh
+# ./run_online_dpo.sh
+# ./run_sea_dpo.sh
+./run_daman.sh

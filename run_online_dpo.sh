@@ -10,14 +10,11 @@ python -m oat.experiment.main \
     --remote-rm-url http://0.0.0.0:8000 \
     --pretrain trl-lib/pythia-1b-deduped-tldr-sft \
     --prompt-data lkevinzc/tldr-with-sft-reference \
-    --output_key pythia-1b-reference \
+    --input-key prompt \
+    --output-key pythia-1b-reference \
     --sync-params-every 1 \
     --rollout-batch-size-per-device 64 \
     --pi-buffer-maxlen-per-device 64 \
     --train-batch-size-per-device 8 \
-    --exp-method EnnBAITS \
-    --num-samples 10 \
-    --best-of-n-exploration \
     --use-wb \
-    --wb-run-name 1b_skywork-8b_dpo_daman \
-    --temperature 1
+    --wb-run-name 1b_skywork-8b_dpo_online

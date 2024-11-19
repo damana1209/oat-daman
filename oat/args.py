@@ -54,8 +54,8 @@ class OATArgs:
     gamma_beta_ratio: float = 0.5
 
     # Oracle.
-    reward_oracle: str = "pairrm"
-    reward_oracle_batch_size: int = 1
+    preference_oracle: str = "pairrm"
+    preference_oracle_batch_size: int = 1
     remote_rm_url: str = ""
     remote_rm_client_workers: int = 4
     # Sampling a Bernoulli to get the binary feedback instead of thresholding.
@@ -270,8 +270,8 @@ class OATArgs:
 #     )  # SimPO https://arxiv.org/pdf/2405.14734
 
 #     # Oracle
-#     parser.add_argument("--reward_oracle", type=str, default="pairrm")
-#     parser.add_argument("--reward_oracle_batch_size", type=int, default=1)
+#     parser.add_argument("--preference_oracle", type=str, default="pairrm")
+#     parser.add_argument("--preference_oracle_batch_size", type=int, default=1)
 #     parser.add_argument("--remote_rm_url", type=str, default="")
 #     parser.add_argument("--remote_rm_client_workers", type=int, default=4)
 #     parser.add_argument("--bt_sample", action="store_true")
